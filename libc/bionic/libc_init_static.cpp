@@ -29,6 +29,7 @@
 #include <android/api-level.h>
 #include <elf.h>
 #include <errno.h>
+#include <malloc.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,10 +37,9 @@
 #include <sys/auxv.h>
 #include <sys/mman.h>
 
+#include "async_safe/log.h"
+#include "heap_tagging.h"
 #include "libc_init_common.h"
-#include "pthread_internal.h"
-#include "sysprop_helpers.h"
-
 #include "platform/bionic/macros.h"
 #include "platform/bionic/mte.h"
 #include "platform/bionic/page.h"
@@ -51,7 +51,9 @@
 #include "private/bionic_elf_tls.h"
 #include "private/bionic_globals.h"
 #include "private/bionic_tls.h"
+#include "pthread_internal.h"
 #include "sys/system_properties.h"
+#include "sysprop_helpers.h"
 
 #if __has_feature(hwaddress_sanitizer)
 #include <sanitizer/hwasan_interface.h>
@@ -74,33 +76,12 @@ static void call_array(init_func_t** list, int argc, char* argv[], char* envp[])
   }
 }
 
-#if defined(__aarch64__) || defined(__x86_64__)
-extern __LIBC_HIDDEN__ __attribute__((weak)) ElfW(Rela) __rela_iplt_start[], __rela_iplt_end[];
-
-static void call_ifunc_resolvers() {
-  if (__rela_iplt_start == nullptr || __rela_iplt_end == nullptr) {
-    // These symbols are not emitted by gold. Gold has code to do so, but for
-    // whatever reason it is not being run. In these cases ifuncs cannot be
-    // resolved, so we do not support using ifuncs in static executables linked
-    // with gold.
-    //
-    // Since they are weak, they will be non-null when linked with bfd/lld and
-    // null when linked with gold.
-    return;
-  }
-
-  for (ElfW(Rela) *r = __rela_iplt_start; r != __rela_iplt_end; ++r) {
-    ElfW(Addr)* offset = reinterpret_cast<ElfW(Addr)*>(r->r_offset);
-    ElfW(Addr) resolver = r->r_addend;
-    *offset = __bionic_call_ifunc_resolver(resolver);
-  }
-}
-#else
+#if defined(__arm__) || defined(__i386__)  // Legacy architectures used REL...
 extern __LIBC_HIDDEN__ __attribute__((weak)) ElfW(Rel) __rel_iplt_start[], __rel_iplt_end[];
 
 static void call_ifunc_resolvers() {
   if (__rel_iplt_start == nullptr || __rel_iplt_end == nullptr) {
-    // These symbols are not emitted by gold. Gold has code to do so, but for
+    // These symbols were not emitted by gold. Gold has code to do so, but for
     // whatever reason it is not being run. In these cases ifuncs cannot be
     // resolved, so we do not support using ifuncs in static executables linked
     // with gold.
@@ -110,9 +91,30 @@ static void call_ifunc_resolvers() {
     return;
   }
 
-  for (ElfW(Rel) *r = __rel_iplt_start; r != __rel_iplt_end; ++r) {
+  for (ElfW(Rel)* r = __rel_iplt_start; r != __rel_iplt_end; ++r) {
     ElfW(Addr)* offset = reinterpret_cast<ElfW(Addr)*>(r->r_offset);
     ElfW(Addr) resolver = *offset;
+    *offset = __bionic_call_ifunc_resolver(resolver);
+  }
+}
+#else  // ...but modern architectures use RELA instead.
+extern __LIBC_HIDDEN__ __attribute__((weak)) ElfW(Rela) __rela_iplt_start[], __rela_iplt_end[];
+
+static void call_ifunc_resolvers() {
+  if (__rela_iplt_start == nullptr || __rela_iplt_end == nullptr) {
+    // These symbols were not emitted by gold. Gold has code to do so, but for
+    // whatever reason it is not being run. In these cases ifuncs cannot be
+    // resolved, so we do not support using ifuncs in static executables linked
+    // with gold.
+    //
+    // Since they are weak, they will be non-null when linked with bfd/lld and
+    // null when linked with gold.
+    return;
+  }
+
+  for (ElfW(Rela)* r = __rela_iplt_start; r != __rela_iplt_end; ++r) {
+    ElfW(Addr)* offset = reinterpret_cast<ElfW(Addr)*>(r->r_offset);
+    ElfW(Addr) resolver = r->r_addend;
     *offset = __bionic_call_ifunc_resolver(resolver);
   }
 }
@@ -215,26 +217,26 @@ static unsigned __get_memtag_note(const ElfW(Phdr)* phdr_start, size_t phdr_ct,
 // Returns true if there's an environment setting (either sysprop or env var)
 // that should overwrite the ELF note, and places the equivalent heap tagging
 // level into *level.
-static bool get_environment_memtag_setting(HeapTaggingLevel* level) {
+static bool get_environment_memtag_setting(const char* basename, HeapTaggingLevel* level) {
   static const char kMemtagPrognameSyspropPrefix[] = "arm64.memtag.process.";
   static const char kMemtagGlobalSysprop[] = "persist.arm64.memtag.default";
+  static const char kMemtagOverrideSyspropPrefix[] =
+      "persist.device_config.memory_safety_native.mode_override.process.";
 
-  const char* progname = __libc_shared_globals()->init_progname;
-  if (progname == nullptr) return false;
+  if (basename == nullptr) return false;
 
-  const char* basename = __gnu_basename(progname);
-
-  static constexpr size_t kOptionsSize = PROP_VALUE_MAX;
-  char options_str[kOptionsSize];
-  size_t sysprop_size = strlen(basename) + strlen(kMemtagPrognameSyspropPrefix) + 1;
-  char* sysprop_name = static_cast<char*>(alloca(sysprop_size));
-
-  async_safe_format_buffer(sysprop_name, sysprop_size, "%s%s", kMemtagPrognameSyspropPrefix,
+  char options_str[PROP_VALUE_MAX];
+  char sysprop_name[512];
+  async_safe_format_buffer(sysprop_name, sizeof(sysprop_name), "%s%s", kMemtagPrognameSyspropPrefix,
                            basename);
-  const char* sys_prop_names[] = {sysprop_name, kMemtagGlobalSysprop};
+  char remote_sysprop_name[512];
+  async_safe_format_buffer(remote_sysprop_name, sizeof(remote_sysprop_name), "%s%s",
+                           kMemtagOverrideSyspropPrefix, basename);
+  const char* sys_prop_names[] = {sysprop_name, remote_sysprop_name, kMemtagGlobalSysprop};
 
+  const char* source = nullptr;
   if (!get_config_from_env_or_sysprops("MEMTAG_OPTIONS", sys_prop_names, arraysize(sys_prop_names),
-                                       options_str, kOptionsSize)) {
+                                       options_str, sizeof(options_str), &source)) {
     return false;
   }
 
@@ -245,14 +247,20 @@ static bool get_environment_memtag_setting(HeapTaggingLevel* level) {
   } else if (strcmp("off", options_str) == 0) {
     *level = M_HEAP_TAGGING_LEVEL_TBI;
   } else {
-    async_safe_format_log(
-        ANDROID_LOG_ERROR, "libc",
-        "unrecognized memtag level: \"%s\" (options are \"sync\", \"async\", or \"off\").",
-        options_str);
+    async_safe_format_log(ANDROID_LOG_ERROR, "libc",
+                          "%s: unrecognized memtag level in %s: \"%s\" (options are \"sync\", "
+                          "\"async\", or \"off\").",
+                          basename, source, options_str);
     return false;
   }
-
+  async_safe_format_log(ANDROID_LOG_DEBUG, "libc", "%s: chose memtag level \"%s\" from %s.",
+                        basename, options_str, source);
   return true;
+}
+
+static void log_elf_memtag_level(const char* basename, const char* level) {
+  async_safe_format_log(ANDROID_LOG_DEBUG, "libc", "%s: chose memtag level \"%s\" from ELF note",
+                        basename ?: "<unknown>", level);
 }
 
 // Returns the initial heap tagging level. Note: This function will never return
@@ -260,12 +268,14 @@ static bool get_environment_memtag_setting(HeapTaggingLevel* level) {
 // M_HEAP_TAGGING_LEVEL_TBI.
 static HeapTaggingLevel __get_heap_tagging_level(const void* phdr_start, size_t phdr_ct,
                                                  uintptr_t load_bias, bool* stack) {
+  const char* progname = __libc_shared_globals()->init_progname;
+  const char* basename = progname ? __gnu_basename(progname) : nullptr;
   unsigned note_val =
       __get_memtag_note(reinterpret_cast<const ElfW(Phdr)*>(phdr_start), phdr_ct, load_bias);
   *stack = note_val & NT_MEMTAG_STACK;
 
   HeapTaggingLevel level;
-  if (get_environment_memtag_setting(&level)) return level;
+  if (get_environment_memtag_setting(basename, &level)) return level;
 
   // Note, previously (in Android 12), any value outside of bits [0..3] resulted
   // in a check-fail. In order to be permissive of further extensions, we
@@ -280,14 +290,17 @@ static HeapTaggingLevel __get_heap_tagging_level(const void* phdr_start, size_t 
       // by anyone, but we note it (heh) here for posterity, in case the zero
       // level becomes meaningful, and binaries with this note can be executed
       // on Android 12 devices.
+      log_elf_memtag_level(basename, "off");
       return M_HEAP_TAGGING_LEVEL_TBI;
     case NT_MEMTAG_LEVEL_ASYNC:
+      log_elf_memtag_level(basename, "async");
       return M_HEAP_TAGGING_LEVEL_ASYNC;
     case NT_MEMTAG_LEVEL_SYNC:
     default:
       // We allow future extensions to specify mode 3 (currently unused), with
       // the idea that it might be used for ASYMM mode or something else. On
       // this version of Android, it falls back to SYNC mode.
+      log_elf_memtag_level(basename, "sync");
       return M_HEAP_TAGGING_LEVEL_SYNC;
   }
 }
@@ -300,7 +313,43 @@ __attribute__((no_sanitize("hwaddress", "memtag"))) void __libc_init_mte(const v
                                                                          void* stack_top) {
   bool memtag_stack;
   HeapTaggingLevel level = __get_heap_tagging_level(phdr_start, phdr_ct, load_bias, &memtag_stack);
-
+  char* env = getenv("BIONIC_MEMTAG_UPGRADE_SECS");
+  static const char kAppProcessName[] = "app_process64";
+  const char* progname = __libc_shared_globals()->init_progname;
+  progname = progname ? __gnu_basename(progname) : nullptr;
+  if (progname &&
+      strncmp(progname, kAppProcessName, sizeof(kAppProcessName)) == 0) {
+    // disable timed upgrade for zygote, as the thread spawned will violate the requirement
+    // that it be single-threaded.
+    env = nullptr;
+  }
+  int64_t timed_upgrade = 0;
+  if (env) {
+    char* endptr;
+    timed_upgrade = strtoll(env, &endptr, 10);
+    if (*endptr != '\0' || timed_upgrade < 0) {
+      async_safe_format_log(ANDROID_LOG_ERROR, "libc",
+                            "Invalid value for BIONIC_MEMTAG_UPGRADE_SECS: %s",
+                            env);
+      timed_upgrade = 0;
+    }
+    // Make sure that this does not get passed to potential processes inheriting
+    // this environment.
+    unsetenv("BIONIC_MEMTAG_UPGRADE_SECS");
+  }
+  if (timed_upgrade) {
+    if (level == M_HEAP_TAGGING_LEVEL_ASYNC) {
+      async_safe_format_log(ANDROID_LOG_INFO, "libc",
+                            "Attempting timed MTE upgrade from async to sync.");
+      __libc_shared_globals()->heap_tagging_upgrade_timer_sec = timed_upgrade;
+      level = M_HEAP_TAGGING_LEVEL_SYNC;
+    } else if (level != M_HEAP_TAGGING_LEVEL_SYNC) {
+      async_safe_format_log(
+          ANDROID_LOG_ERROR, "libc",
+          "Requested timed MTE upgrade from invalid %s to sync. Ignoring.",
+          DescribeTaggingLevel(level));
+    }
+  }
   if (level == M_HEAP_TAGGING_LEVEL_SYNC || level == M_HEAP_TAGGING_LEVEL_ASYNC) {
     unsigned long prctl_arg = PR_TAGGED_ADDR_ENABLE | PR_MTE_TAG_SET_NONZERO;
     prctl_arg |= (level == M_HEAP_TAGGING_LEVEL_SYNC) ? PR_MTE_TCF_SYNC : PR_MTE_TCF_ASYNC;
@@ -331,6 +380,8 @@ __attribute__((no_sanitize("hwaddress", "memtag"))) void __libc_init_mte(const v
   if (prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE, 0, 0, 0) == 0) {
     __libc_shared_globals()->initial_heap_tagging_level = M_HEAP_TAGGING_LEVEL_TBI;
   }
+  // We did not enable MTE, so we do not need to arm the upgrade timer.
+  __libc_shared_globals()->heap_tagging_upgrade_timer_sec = 0;
 }
 #else   // __aarch64__
 void __libc_init_mte(const void*, size_t, uintptr_t, void*) {}
@@ -381,6 +432,8 @@ __attribute__((no_sanitize("memtag"))) __noreturn static void __real_libc_init(
   if (structors->fini_array != nullptr) {
     __cxa_atexit(__libc_fini,structors->fini_array,nullptr);
   }
+
+  __libc_init_mte_late();
 
   exit(slingshot(args.argc, args.argv, args.envp));
 }

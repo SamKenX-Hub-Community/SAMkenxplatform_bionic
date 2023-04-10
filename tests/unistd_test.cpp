@@ -294,10 +294,13 @@ TEST(UNISTD_TEST, unsetenv_EINVAL) {
 }
 
 TEST(UNISTD_TEST, setenv_EINVAL) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnonnull"
   EXPECT_EQ(-1, setenv(nullptr, "value", 0));
   EXPECT_EQ(EINVAL, errno);
   EXPECT_EQ(-1, setenv(nullptr, "value", 1));
   EXPECT_EQ(EINVAL, errno);
+#pragma clang diagnostic pop
   EXPECT_EQ(-1, setenv("", "value", 0));
   EXPECT_EQ(EINVAL, errno);
   EXPECT_EQ(-1, setenv("", "value", 1));
@@ -586,9 +589,10 @@ TEST(UNISTD_TEST, gettid_caching_and_clone_process_settid) {
   TestGetTidCachingWithFork(CloneAndSetTid, exit);
 }
 
+__attribute__((no_sanitize("hwaddress", "memtag")))
 static int CloneStartRoutine(int (*start_routine)(void*)) {
   void* child_stack[1024];
-  return clone(start_routine, untag_address(&child_stack[1024]), SIGCHLD, nullptr);
+  return clone(start_routine, &child_stack[1024], SIGCHLD, nullptr);
 }
 
 static int GetPidCachingCloneStartRoutine(void*) {
@@ -1101,6 +1105,10 @@ TEST(UNISTD_TEST, get_cpu_count_from_string) {
   ASSERT_EQ(1, GetCpuCountFromString("0"));
   ASSERT_EQ(40, GetCpuCountFromString("0-39"));
   ASSERT_EQ(4, GetCpuCountFromString("0, 1-2, 4\n"));
+}
+
+TEST(UNISTD_TEST, sysconf_SC_NPROCESSORS_make_sense) {
+  ASSERT_LE(sysconf(_SC_NPROCESSORS_ONLN), sysconf(_SC_NPROCESSORS_CONF));
 }
 
 TEST(UNISTD_TEST, sysconf_SC_NPROCESSORS_ONLN) {
